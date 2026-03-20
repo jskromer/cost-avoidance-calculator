@@ -560,13 +560,67 @@ consumption independently, then subtracting.
 
 The common shortcut — multiplying energy savings by an average rate — produces
 errors because rate schedules are **non-linear**. Tiered rates, time-of-use
-rates, and seasonal differentials all mean that not every kWh has the same
-dollar value. The kWh you *avoid* consuming are typically not at the average
-cost — they're at the **marginal** cost, which differs.
+rates, seasonal differentials, and wholesale market dynamics all mean that
+not every kWh has the same dollar value. The kWh you *avoid* consuming are
+typically not at the average cost — they're at the **marginal** cost, which differs.
+"""
+    )
 
-This tool generates synthetic 8760 hourly load profiles, applies real
-residential tariff structures from 6 U.S. utilities, and quantifies the
-error from the naive approach.
+with st.expander("Simulation methodology"):
+    st.markdown(
+        """
+#### Load Shape Generation
+Baseline consumption is a **synthetic 8760 hourly profile** built from three components:
+- **Baseload** (~0.3–0.5 kW constant): refrigeration, standby electronics, always-on loads
+- **Occupancy-driven** (6AM–10PM): lighting, plug loads, cooking — modeled as a rectangular
+  occupancy schedule scaled to represent typical residential activity
+- **Weather-driven (HVAC)**: heating and cooling loads derived from a sinusoidal annual
+  temperature model with diurnal swing (±8°F). Cooling activates above a cooling balance
+  point, heating below a heating balance point, with magnitude proportional to the
+  temperature difference (degree-hour proxy). Climate profiles approximate the 6 utility
+  territories plus CAISO central CA.
+
+Random noise (±5–10%) is added for realism. The profile is scaled so the annual total
+matches the user-selected consumption level (default 8,000 kWh/year).
+
+#### ECM Savings Shapes
+Each ECM type produces a **different temporal savings profile**, which is the key to
+why the naive method fails:
+- **Lighting retrofit**: saves only during occupied hours (6AM–10PM), zero overnight, flat across seasons
+- **HVAC upgrade**: saves proportional to the HVAC load component — large summer savings in
+  cooling-dominated climates, large winter savings in heating-dominated climates, minimal in shoulder months
+- **Envelope improvement**: similar temporal shape to HVAC (reduces weather-driven load)
+- **Behavioral/controls**: blend of baseload reduction (40%) and occupancy reduction (60%)
+- **Custom flat %**: uniform reduction every hour — this *is* the naive assumption made visible
+
+All savings shapes are scaled so total annual kWh saved matches the user-selected percentage.
+
+#### Tariff Data
+Seven rate structures are encoded from published 2025–2026 tariff sheets:
+
+| Tariff | Structure | Source |
+|--------|-----------|--------|
+| **PG&E E-1** | 2-tier inclining block, seasonal baseline by territory | PG&E rate schedule, eff. Jan 2026 |
+| **SCE Schedule D** | 2-tier inclining block, daily baseline by region | SCE tariff book, eff. Jan 2026 |
+| **Con Edison Rate I** | Seasonal delivery tiers (250 kWh breakpoint) + variable supply | NY PSC-approved rates, eff. Jan 2026 |
+| **Xcel Energy RE-TOU** | Time-of-use (5–9PM weekday on-peak), no volume tiers | Xcel CO tariff, eff. Nov 2025 |
+| **Hawaiian Electric Sch R** | Flat volumetric (base + ECRC + surcharges) | HECO Schedule R, PUC D&O 38164 |
+| **PSEG NJ RS** | Flat delivery + seasonal BGS supply | PSEG tariff + BGS auction, eff. Jul 2025 |
+| **CAISO Wholesale** | Simulated 8760 hourly LMP with duck-curve negative pricing | Synthetic curve modeled on CAISO SP15 day-ahead patterns |
+
+The CAISO wholesale curve is **not historical data** — it is a synthetic hourly price model
+calibrated to reproduce key features of real CAISO markets: negative midday prices in
+spring/summer (solar oversupply, −$20 to −$60/MWh), evening ramp spikes ($60–100/MWh),
+moderate overnight prices, and weekend discounts. Approximately 13% of hours are negative-priced.
+
+#### Blended Rate Calculation (Naive Method)
+For **retail tariffs**, the naive blended rate = total baseline energy charges ÷ total baseline kWh.
+This is consumption-weighted and excludes fixed charges — it's what a practitioner would calculate
+by dividing the bill by usage.
+
+For **CAISO wholesale**, the naive rate = simple time-average of all 8,760 hourly prices
+(unweighted). This is what appears in market reports as "average LMP" and is the number
+a practitioner would grab to estimate savings value.
 """
     )
 
