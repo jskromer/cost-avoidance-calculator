@@ -2,7 +2,7 @@
 
 A Streamlit app demonstrating why cost avoidance must be calculated by applying the full rate schedule to **both** the adjusted baseline consumption **and** the actual consumption independently — not by multiplying energy savings by a blended average rate.
 
-**Live:** [cost-avoidance-calculator on Streamlit Cloud](https://cost-avoidance-calculator-m2n5xq9kudmg6htwtutsmn.streamlit.app)
+**Live:** [cost-avoidance-calculator.streamlit.app](https://cost-avoidance-calculator.streamlit.app)
 
 ## The Teaching Point
 
