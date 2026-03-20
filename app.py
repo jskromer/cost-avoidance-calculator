@@ -1,10 +1,15 @@
 """
-Cost Avoidance Calculator — CMVP Training Tool
+Cost & Carbon Avoidance Calculator — CMVP Training Tool
 
 Demonstrates why cost avoidance must be calculated by applying the full rate
 schedule to BOTH the adjusted baseline consumption AND the actual consumption
 independently, then subtracting. The naive approach (energy savings x average
 rate) produces errors that this tool quantifies.
+
+The same principle applies to carbon avoidance: you can't multiply saved kWh
+by an average grid emissions factor. You need marginal emissions factors (MEF)
+that vary by hour — low midday when solar/wind is on the margin, high in the
+evening when gas peakers fire up.
 
 Author: Counterfactual Designs
 """
@@ -21,7 +26,7 @@ import calendar
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Cost Avoidance Calculator",
+    page_title="Cost & Carbon Avoidance Calculator",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -171,6 +176,133 @@ def simulate_caiso_prices() -> np.ndarray:
 
 # Cache the CAISO price curve (computed once)
 CAISO_PRICES = simulate_caiso_prices()
+
+
+# ---------------------------------------------------------------------------
+# Marginal emissions factors (MEF) — synthetic 8760 curves by grid region
+# ---------------------------------------------------------------------------
+UTILITY_GRID_MAP = {
+    "PG&E E-1 (Tiered)": "CAISO",
+    "SCE Schedule D (Tiered)": "CAISO",
+    "Con Edison Rate I (Seasonal Delivery)": "NYISO",
+    "Xcel Energy CO RE-TOU (Time-of-Use)": "WEIS_RMPA",
+    "Hawaiian Electric Sch R (Flat)": "HECO",
+    "PSEG NJ RS (Flat + Seasonal Supply)": "PJM",
+    "CAISO Wholesale (Neg. Pricing)": "CAISO",
+}
+
+# Grid region parameters: avg MEF (lbs CO2/kWh), midday min, evening max,
+# overnight level, seasonal amplitude (how much summer solar depresses midday)
+GRID_REGION_PARAMS = {
+    "CAISO": {
+        "avg": 0.45, "midday_min": 0.15, "evening_max": 0.85,
+        "overnight": 0.55, "seasonal_solar_amp": 0.25,
+        "description": "California ISO — heavy solar penetration",
+    },
+    "NYISO": {
+        "avg": 0.55, "midday_min": 0.40, "evening_max": 0.80,
+        "overnight": 0.60, "seasonal_solar_amp": 0.12,
+        "description": "New York ISO — moderate renewables",
+    },
+    "WEIS_RMPA": {
+        "avg": 0.75, "midday_min": 0.60, "evening_max": 0.95,
+        "overnight": 0.78, "seasonal_solar_amp": 0.10,
+        "description": "Western EIS / RMPA — coal-heavy baseload",
+    },
+    "HECO": {
+        "avg": 0.70, "midday_min": 0.55, "evening_max": 0.85,
+        "overnight": 0.72, "seasonal_solar_amp": 0.10,
+        "description": "Hawaiian Electric — oil-dependent grid",
+    },
+    "PJM": {
+        "avg": 0.65, "midday_min": 0.50, "evening_max": 0.80,
+        "overnight": 0.68, "seasonal_solar_amp": 0.10,
+        "description": "PJM Interconnection — gas/coal mix",
+    },
+}
+
+
+def simulate_marginal_emissions(grid_region: str) -> np.ndarray:
+    """Return 8760 hourly marginal emissions factors (lbs CO2/kWh) for a grid region.
+
+    Models the diurnal and seasonal variation in grid marginal emissions:
+    - Lowest midday (10AM-3PM) when solar/wind is on the margin
+    - Highest evening (5-9PM) when gas peakers fire up
+    - Moderate overnight
+    - Seasonal: summer has deeper midday depression (more solar), winter is flatter
+    """
+    np.random.seed(77 + hash(grid_region) % 100)
+    params = GRID_REGION_PARAMS[grid_region]
+    mef = np.zeros(HOURS_IN_YEAR)
+
+    midday_min = params["midday_min"]
+    evening_max = params["evening_max"]
+    overnight = params["overnight"]
+    solar_amp = params["seasonal_solar_amp"]
+
+    for h in range(HOURS_IN_YEAR):
+        month = MONTH_ARR[h]
+        hour = HOUR_ARR[h]
+        day_of_year = DOY_ARR[h]
+
+        # Seasonal factor: summer has more solar depression
+        # Peak solar effect around day 172 (summer solstice)
+        seasonal_solar = solar_amp * np.sin(2 * np.pi * (day_of_year - 80) / 365)
+        seasonal_solar = max(seasonal_solar, 0)  # Only depress in summer half
+
+        # Winter has slightly higher baseline emissions (more heating load = more gas/coal)
+        winter_boost = 0.05 * np.cos(2 * np.pi * (day_of_year - 10) / 365)
+        winter_boost = max(winter_boost, 0)
+
+        # Diurnal pattern
+        if 10 <= hour <= 14:
+            # Midday: low emissions (solar/wind on margin)
+            # Deeper depression in summer
+            base_mef = midday_min - seasonal_solar
+            # Smooth shape within the midday window
+            midday_shape = np.sin(np.pi * (hour - 10) / 4)
+            base_mef = midday_min - seasonal_solar * midday_shape
+        elif 15 <= hour <= 16:
+            # Transition from midday to evening
+            t = (hour - 15) / 2.0
+            base_mef = midday_min * (1 - t) + overnight * t
+        elif 17 <= hour <= 20:
+            # Evening peak: gas peakers on margin
+            evening_shape = np.sin(np.pi * (hour - 17) / 3)
+            base_mef = overnight + (evening_max - overnight) * evening_shape
+        elif 21 <= hour <= 23:
+            # Late evening ramp-down
+            t = (hour - 21) / 3.0
+            base_mef = evening_max * (1 - t) + overnight * t
+        elif 6 <= hour <= 9:
+            # Morning ramp: transitioning from overnight to approaching midday
+            t = (hour - 6) / 4.0
+            base_mef = overnight * (1 - t) + (midday_min + 0.10) * t
+        else:
+            # Overnight (0-5 AM)
+            base_mef = overnight
+
+        # Add winter boost
+        base_mef += winter_boost
+
+        # Add noise (±10%)
+        noise = np.random.normal(1.0, 0.10)
+        noise = np.clip(noise, 0.80, 1.20)
+        mef[h] = base_mef * noise
+
+    # Clip to reasonable range
+    mef = np.clip(mef, 0.0, 1.5)
+
+    # Scale so the annual average matches the target avg
+    current_avg = mef.mean()
+    if current_avg > 0:
+        mef *= params["avg"] / current_avg
+
+    return mef
+
+
+# Cache all grid region MEF arrays (computed once at module level)
+GRID_MEF_CACHE = {region: simulate_marginal_emissions(region) for region in GRID_REGION_PARAMS}
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +580,60 @@ def compute_cost_avoidance(baseline_8760: np.ndarray, actual_8760: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Carbon avoidance calculations
+# ---------------------------------------------------------------------------
+def compute_carbon_avoidance(baseline_8760: np.ndarray, actual_8760: np.ndarray,
+                             utility: str) -> dict:
+    """Compute correct and naive carbon avoidance using marginal emissions factors.
+
+    Correct method: sum of (savings_h x MEF_h) for each hour — uses hourly marginal
+    emissions factors that reflect what generation source is actually on the margin.
+
+    Naive method: total_kwh_saved x annual_average_MEF — assumes every kWh saved
+    displaces the same average amount of carbon regardless of when it occurs.
+
+    Returns dict with lbs CO2 avoided (correct and naive), error, and monthly breakdowns.
+    """
+    grid_region = UTILITY_GRID_MAP.get(utility, "PJM")
+    mef_8760 = GRID_MEF_CACHE[grid_region]
+
+    savings_8760 = baseline_8760 - actual_8760
+
+    # Correct: hourly savings × hourly MEF
+    correct_carbon = (savings_8760 * mef_8760).sum()
+
+    # Naive: total savings × annual average MEF
+    avg_mef = mef_8760.mean()
+    total_kwh_saved = savings_8760.sum()
+    naive_carbon = total_kwh_saved * avg_mef
+
+    # Error
+    carbon_error = naive_carbon - correct_carbon
+    carbon_error_pct = (carbon_error / correct_carbon * 100) if abs(correct_carbon) > 0.01 else 0.0
+
+    # Monthly breakdowns
+    monthly_correct_carbon = []
+    monthly_naive_carbon = []
+    for i in range(12):
+        s, e = MONTHLY_SLICES[i]
+        m_savings = savings_8760[s:e]
+        m_mef = mef_8760[s:e]
+        monthly_correct_carbon.append((m_savings * m_mef).sum())
+        monthly_naive_carbon.append(m_savings.sum() * avg_mef)
+
+    return {
+        "correct_carbon": correct_carbon,
+        "naive_carbon": naive_carbon,
+        "carbon_error": carbon_error,
+        "carbon_error_pct": carbon_error_pct,
+        "avg_mef": avg_mef,
+        "monthly_correct_carbon": monthly_correct_carbon,
+        "monthly_naive_carbon": monthly_naive_carbon,
+        "grid_region": grid_region,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Explanation text generator
 # ---------------------------------------------------------------------------
 def get_explanation(utility: str, error: float) -> str:
@@ -510,6 +696,60 @@ def get_explanation(utility: str, error: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Carbon explanation text generator
+# ---------------------------------------------------------------------------
+def get_carbon_explanation(utility: str, error: float) -> str:
+    """Return a pedagogical explanation of WHY the carbon error occurs for this grid."""
+    grid_region = UTILITY_GRID_MAP.get(utility, "PJM")
+    direction = "overstates" if error > 0 else "understates"
+
+    explanations = {
+        "CAISO": (
+            f"California's grid has massive solar penetration. Midday marginal emissions "
+            f"drop to ~0.15 lbs CO2/kWh because solar and wind are on the margin — saving "
+            f"a kWh of HVAC at noon displaces almost no fossil generation. But by 6 PM, solar "
+            f"drops off and gas peakers fire up, pushing marginal emissions to ~0.85 lbs CO2/kWh. "
+            f"The naive method uses the annual average MEF (~0.45 lbs/kWh), which {direction} "
+            f"the carbon impact because it ignores this extreme diurnal swing. An HVAC measure "
+            f"that saves mostly midday kWh avoids far less carbon than the naive method suggests."
+        ),
+        "NYISO": (
+            f"New York's grid has moderate renewable penetration — enough to create meaningful "
+            f"diurnal variation in marginal emissions (midday ~0.40 vs evening ~0.80 lbs CO2/kWh), "
+            f"but less extreme than California. The naive average MEF (~0.55 lbs/kWh) {direction} "
+            f"carbon avoidance because savings concentrated during midday hours displace cleaner "
+            f"generation than the average implies. The error is smaller than CAISO but still "
+            f"significant enough to matter for carbon reporting."
+        ),
+        "WEIS_RMPA": (
+            f"Colorado's grid has a coal-heavy baseload that keeps marginal emissions high across "
+            f"all hours (~0.60–0.95 lbs CO2/kWh). There is some midday solar relief, but the "
+            f"baseline is elevated compared to coastal grids. The naive average MEF (~0.75 lbs/kWh) "
+            f"{direction} carbon avoidance. The error is smaller in percentage terms because the "
+            f"diurnal variation is less extreme, but the absolute emissions are higher — every kWh "
+            f"saved in Colorado avoids more carbon than in California, regardless of time of day."
+        ),
+        "HECO": (
+            f"Hawaii's grid is oil-dependent with emerging solar. Oil-fired generation provides "
+            f"a high baseline marginal emissions rate (~0.70 lbs CO2/kWh average), with moderate "
+            f"midday relief from growing rooftop and utility-scale solar (~0.55 midday vs ~0.85 "
+            f"evening). The naive average MEF {direction} carbon avoidance. Hawaii's grid is "
+            f"transitioning — as solar penetration increases, the diurnal MEF swing will widen, "
+            f"making the naive method increasingly unreliable."
+        ),
+        "PJM": (
+            f"PJM's gas/coal generation mix produces moderate diurnal variation in marginal "
+            f"emissions (~0.50 midday vs ~0.80 evening, averaging ~0.65 lbs CO2/kWh). The naive "
+            f"method {direction} carbon avoidance because it cannot distinguish between a kWh "
+            f"saved at 2 PM (when gas combined-cycle or renewables may be marginal) versus 7 PM "
+            f"(when less efficient gas peakers are dispatched). The error is meaningful for "
+            f"carbon accounting and ESG reporting."
+        ),
+    }
+    return explanations.get(grid_region, "")
+
+
+# ---------------------------------------------------------------------------
 # Color palette
 # ---------------------------------------------------------------------------
 COLOR_BASELINE = "#1f77b4"
@@ -525,6 +765,10 @@ COLOR_DELIVERY = "#636EFA"
 COLOR_SUPPLY = "#00CC96"
 COLOR_ON_PEAK = "#EF553B"
 COLOR_OFF_PEAK = "#636EFA"
+COLOR_CARBON_CORRECT = "#2d6a4f"
+COLOR_CARBON_NAIVE = "#ae2012"
+COLOR_CARBON_ERROR = "#e76f51"
+COLOR_MEF = "#7209b7"
 
 
 # ===========================================================================
@@ -541,6 +785,9 @@ st.markdown(
     .metric-card.correct { border-left-color: #2ca02c; }
     .metric-card.naive { border-left-color: #d62728; }
     .metric-card.error { border-left-color: #ff7f0e; }
+    .metric-card.correct-carbon { border-left-color: #2d6a4f; background: #f0f7f4; }
+    .metric-card.naive-carbon { border-left-color: #ae2012; background: #fdf2f0; }
+    .metric-card.error-carbon { border-left-color: #e76f51; background: #fef7f0; }
     .metric-label { font-size: 0.85rem; color: #666; margin-bottom: 2px; }
     .metric-value { font-size: 1.6rem; font-weight: 700; }
     </style>
@@ -548,7 +795,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Cost Avoidance Calculator")
+st.title("Cost & Carbon Avoidance Calculator")
 
 with st.expander("About this tool"):
     st.markdown(
@@ -558,11 +805,25 @@ cost avoidance must be calculated by applying the full rate schedule to
 **both** the adjusted baseline consumption **and** the actual (post-retrofit)
 consumption independently, then subtracting.
 
+The same principle applies to **carbon avoidance**: you can't multiply saved
+kWh by an average grid emissions factor. You need hourly **marginal emissions
+factors (MEF)** that reflect what generation source is actually on the margin
+at each hour.
+
+This tool generates synthetic 8760 hourly load profiles, applies real tariff
+structures from 7 rate schedules, and quantifies the error from the naive
+approach — for both **cost** and **carbon** avoidance.
+
 The common shortcut — multiplying energy savings by an average rate — produces
 errors because rate schedules are **non-linear**. Tiered rates, time-of-use
 rates, seasonal differentials, and wholesale market dynamics all mean that
 not every kWh has the same dollar value. The kWh you *avoid* consuming are
 typically not at the average cost — they're at the **marginal** cost, which differs.
+
+The same logic applies to emissions: grid marginal emissions vary hourly based
+on which generation source is dispatched at the margin. Saving a kWh at noon
+in California (when solar is on the margin) avoids almost no carbon, while
+saving a kWh at 7 PM (when gas peakers are running) avoids a lot.
 """
     )
 
@@ -621,6 +882,18 @@ by dividing the bill by usage.
 For **CAISO wholesale**, the naive rate = simple time-average of all 8,760 hourly prices
 (unweighted). This is what appears in market reports as "average LMP" and is the number
 a practitioner would grab to estimate savings value.
+
+#### Marginal Emissions Factors
+Grid emissions vary hourly based on which generation source is on the margin. This tool uses
+synthetic 8760 marginal emissions factor (MEF) curves modeled on regional grid characteristics:
+
+- **CAISO** (PG&E, SCE): Heavy solar penetration drives midday MEF near zero; evening gas peakers push MEF to ~0.85 lbs CO2/kWh
+- **NYISO** (Con Edison): Moderate renewables, less extreme diurnal swing
+- **WEIS/RMPA** (Xcel CO): Coal-heavy baseload keeps emissions high; some solar relief midday
+- **HECO** (Hawaiian Electric): Oil-dependent grid with emerging solar
+- **PJM** (PSEG NJ): Gas/coal mix with moderate diurnal variation
+
+The naive approach uses the annual average MEF (lbs CO2/kWh). The correct approach uses hourly MEFs, which capture the temporal mismatch between when savings occur and what's actually on the margin.
 """
     )
 
@@ -663,13 +936,15 @@ baseline_8760 = baseline["total"]
 actual_8760 = baseline_8760 - savings
 
 ca = compute_cost_avoidance(baseline_8760, actual_8760, utility)
+carbon = compute_carbon_avoidance(baseline_8760, actual_8760, utility)
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Load Shapes", "Bill Calculation",
-    "Cost Avoidance — The Point", "Compare All Utilities",
+    "Cost Avoidance — The Point", "Carbon Avoidance",
+    "Compare All Utilities",
 ])
 
 # ===================== TAB 1: Load Shapes =====================
@@ -1044,8 +1319,168 @@ with tab3:
     explanation = get_explanation(utility, ca["error"])
     st.info(explanation)
 
-# ===================== TAB 4: Compare All Utilities =====================
+# ===================== TAB 4: Carbon Avoidance =====================
 with tab4:
+    st.subheader("Carbon Avoidance Comparison")
+    st.caption(
+        f"Grid region: **{carbon['grid_region']}** "
+        f"({GRID_REGION_PARAMS[carbon['grid_region']]['description']})"
+    )
+
+    # Big metric cards — carbon style
+    cm1, cm2, cm3 = st.columns(3)
+    with cm1:
+        st.markdown(
+            f"""<div class="metric-card correct-carbon">
+            <div class="metric-label">&#10003; Correct Carbon Avoided</div>
+            <div class="metric-value">{carbon['correct_carbon']:,.0f} lbs CO&#8322;</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    with cm2:
+        st.markdown(
+            f"""<div class="metric-card naive-carbon">
+            <div class="metric-label">&#10007; Naive Carbon Avoided</div>
+            <div class="metric-value">{carbon['naive_carbon']:,.0f} lbs CO&#8322;</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    with cm3:
+        cerr_sign = "+" if carbon["carbon_error"] >= 0 else ""
+        st.markdown(
+            f"""<div class="metric-card error-carbon">
+            <div class="metric-label">&#9888; Error (Naive − Correct)</div>
+            <div class="metric-value">{cerr_sign}{carbon['carbon_error']:,.0f} lbs ({cerr_sign}{carbon['carbon_error_pct']:.1f}%)</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+
+    # Methodology boxes
+    cmc1, cmc2 = st.columns(2)
+    with cmc1:
+        st.markdown(
+            f"""**Correct Method** — hourly savings × hourly marginal emissions factor:
+1. For each hour h: carbon_avoided_h = savings_h × MEF_h
+2. MEF varies from ~{GRID_REGION_PARAMS[carbon['grid_region']]['midday_min']:.2f} lbs/kWh (midday) to ~{GRID_REGION_PARAMS[carbon['grid_region']]['evening_max']:.2f} lbs/kWh (evening)
+3. Total = sum of all 8760 hourly values = **{carbon['correct_carbon']:,.0f} lbs CO2**
+"""
+        )
+    with cmc2:
+        st.markdown(
+            f"""**Naive Method** — total kWh saved × annual average MEF:
+1. Energy savings: {ca['energy_savings_kwh']:,.0f} kWh
+2. Average MEF: {carbon['avg_mef']:.3f} lbs CO2/kWh
+3. Naive carbon avoided = {ca['energy_savings_kwh']:,.0f} × {carbon['avg_mef']:.3f} = **{carbon['naive_carbon']:,.0f} lbs CO2**
+"""
+        )
+
+    # Monthly carbon avoidance bar chart
+    st.subheader("Monthly Carbon Avoidance: Correct vs Naive")
+    fig_carb = go.Figure()
+    fig_carb.add_trace(go.Bar(
+        x=MONTH_NAMES, y=carbon["monthly_correct_carbon"],
+        name="Correct (hourly MEF)", marker_color=COLOR_CARBON_CORRECT,
+    ))
+    fig_carb.add_trace(go.Bar(
+        x=MONTH_NAMES, y=carbon["monthly_naive_carbon"],
+        name="Naive (avg MEF)", marker_color=COLOR_CARBON_NAIVE, opacity=0.7,
+    ))
+    fig_carb.update_layout(
+        barmode="group",
+        yaxis_title="lbs CO2 / month",
+        height=400,
+        margin=dict(l=40, r=20, t=20, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_carb, width="stretch")
+
+    # Carbon explanation
+    st.subheader("Why Does the Carbon Error Occur?")
+    carbon_explanation = get_carbon_explanation(utility, carbon["carbon_error"])
+    st.info(carbon_explanation)
+
+    st.divider()
+
+    # Dual-axis chart: savings load shape vs MEF for a typical summer day
+    st.subheader("The Mismatch: Savings Shape vs Marginal Emissions (Typical Summer Day)")
+    st.caption(
+        "This chart reveals the core problem: when savings peak (midday HVAC), "
+        "marginal emissions are at their lowest. The naive method misses this entirely."
+    )
+
+    grid_region = carbon["grid_region"]
+    mef_8760 = GRID_MEF_CACHE[grid_region]
+
+    # Use Jul 15 as typical summer day
+    summer_day_h = 195 * 24
+    hours_24 = list(range(24))
+    savings_day = savings_8760[summer_day_h:summer_day_h + 24]
+    mef_day = mef_8760[summer_day_h:summer_day_h + 24]
+
+    fig_dual = go.Figure()
+
+    # Savings on primary y-axis
+    fig_dual.add_trace(go.Bar(
+        x=hours_24, y=savings_day,
+        name="Savings (kW)",
+        marker_color=COLOR_SAVINGS,
+        opacity=0.7,
+        yaxis="y",
+    ))
+
+    # MEF on secondary y-axis
+    fig_dual.add_trace(go.Scatter(
+        x=hours_24, y=mef_day,
+        mode="lines+markers",
+        name="Marginal Emissions Factor (lbs CO2/kWh)",
+        line=dict(color=COLOR_MEF, width=3),
+        marker=dict(size=6),
+        yaxis="y2",
+    ))
+
+    # Average MEF line
+    fig_dual.add_trace(go.Scatter(
+        x=hours_24, y=[carbon["avg_mef"]] * 24,
+        mode="lines",
+        name=f"Annual Avg MEF ({carbon['avg_mef']:.3f})",
+        line=dict(color=COLOR_MEF, width=2, dash="dash"),
+        yaxis="y2",
+    ))
+
+    fig_dual.update_layout(
+        xaxis_title="Hour of Day",
+        yaxis=dict(
+            title=dict(text="Savings (kW)", font=dict(color=COLOR_SAVINGS)),
+            tickfont=dict(color=COLOR_SAVINGS),
+        ),
+        yaxis2=dict(
+            title=dict(text="MEF (lbs CO2/kWh)", font=dict(color=COLOR_MEF)),
+            tickfont=dict(color=COLOR_MEF),
+            anchor="x",
+            overlaying="y",
+            side="right",
+            rangemode="tozero",
+        ),
+        height=450,
+        margin=dict(l=60, r=60, t=20, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        barmode="overlay",
+    )
+
+    st.plotly_chart(fig_dual, width="stretch")
+
+    st.markdown(
+        f"**Key insight:** On this summer day, savings peak during midday hours "
+        f"when the MEF is at its lowest (~{mef_day[12]:.2f} lbs/kWh at noon). "
+        f"The naive method values those kWh at the annual average "
+        f"({carbon['avg_mef']:.3f} lbs/kWh), overstating the carbon impact of "
+        f"midday savings and understating the impact of evening savings."
+    )
+
+# ===================== TAB 5: Compare All Utilities =====================
+with tab5:
     st.subheader("Cross-Utility Comparison")
     st.caption(
         "Same load profile and ECM applied across all 7 rate schedules."
@@ -1054,16 +1489,22 @@ with tab4:
     comparison_rows = []
     for u_name in UTILITY_NAMES:
         u_ca = compute_cost_avoidance(baseline_8760, actual_8760, u_name)
+        u_carbon = compute_carbon_avoidance(baseline_8760, actual_8760, u_name)
         comparison_rows.append({
             "Utility": u_name,
             "Correct Avoidance ($)": f"{u_ca['correct_avoidance']:,.2f}",
             "Naive Avoidance ($)": f"{u_ca['naive_avoidance']:,.2f}",
-            "Error ($)": f"{u_ca['error']:+,.2f}",
-            "Error (%)": f"{u_ca['error_pct']:+.1f}%",
+            "Cost Error (%)": f"{u_ca['error_pct']:+.1f}%",
+            "Carbon Correct (lbs)": f"{u_carbon['correct_carbon']:,.0f}",
+            "Carbon Naive (lbs)": f"{u_carbon['naive_carbon']:,.0f}",
+            "Carbon Error (%)": f"{u_carbon['carbon_error_pct']:+.1f}%",
             "_error_pct": u_ca["error_pct"],
             "_correct": u_ca["correct_avoidance"],
             "_naive": u_ca["naive_avoidance"],
             "_error": u_ca["error"],
+            "_carbon_error_pct": u_carbon["carbon_error_pct"],
+            "_carbon_correct": u_carbon["correct_carbon"],
+            "_carbon_naive": u_carbon["naive_carbon"],
         })
 
     df_comp = pd.DataFrame(comparison_rows)
@@ -1071,13 +1512,14 @@ with tab4:
     # Display table (without internal columns)
     st.dataframe(
         df_comp[["Utility", "Correct Avoidance ($)", "Naive Avoidance ($)",
-                 "Error ($)", "Error (%)"]],
+                 "Cost Error (%)", "Carbon Correct (lbs)", "Carbon Naive (lbs)",
+                 "Carbon Error (%)"]],
         hide_index=True,
         width="stretch",
     )
 
-    # Bar chart of error %
-    st.subheader("Error Magnitude by Utility")
+    # Bar chart of cost error %
+    st.subheader("Cost Error Magnitude by Utility")
     fig_err = go.Figure()
 
     short_names = [n.split("(")[0].strip() for n in UTILITY_NAMES]
@@ -1093,14 +1535,36 @@ with tab4:
         textposition="outside",
     ))
     fig_err.update_layout(
-        yaxis_title="Error (%)",
+        yaxis_title="Cost Error (%)",
         height=400,
         margin=dict(l=40, r=20, t=20, b=80),
     )
     fig_err.add_hline(y=0, line_dash="dash", line_color="gray")
     st.plotly_chart(fig_err, width="stretch")
 
-    # Correct vs Naive grouped bar
+    # Bar chart of carbon error %
+    st.subheader("Carbon Error Magnitude by Utility")
+    fig_cerr = go.Figure()
+
+    fig_cerr.add_trace(go.Bar(
+        x=short_names,
+        y=df_comp["_carbon_error_pct"].tolist(),
+        marker_color=[
+            COLOR_CARBON_ERROR if abs(e) > 1 else COLOR_CARBON_CORRECT
+            for e in df_comp["_carbon_error_pct"]
+        ],
+        text=[f"{e:+.1f}%" for e in df_comp["_carbon_error_pct"]],
+        textposition="outside",
+    ))
+    fig_cerr.update_layout(
+        yaxis_title="Carbon Error (%)",
+        height=400,
+        margin=dict(l=40, r=20, t=20, b=80),
+    )
+    fig_cerr.add_hline(y=0, line_dash="dash", line_color="gray")
+    st.plotly_chart(fig_cerr, width="stretch")
+
+    # Correct vs Naive grouped bar — cost
     st.subheader("Cost Avoidance: Correct vs Naive")
     fig_cmp = go.Figure()
     fig_cmp.add_trace(go.Bar(
@@ -1125,10 +1589,37 @@ with tab4:
     )
     st.plotly_chart(fig_cmp, width="stretch")
 
+    # Correct vs Naive grouped bar — carbon
+    st.subheader("Carbon Avoidance: Correct vs Naive")
+    fig_ccmp = go.Figure()
+    fig_ccmp.add_trace(go.Bar(
+        x=short_names,
+        y=df_comp["_carbon_correct"].tolist(),
+        name="Correct (hourly MEF)",
+        marker_color=COLOR_CARBON_CORRECT,
+    ))
+    fig_ccmp.add_trace(go.Bar(
+        x=short_names,
+        y=df_comp["_carbon_naive"].tolist(),
+        name="Naive (avg MEF)",
+        marker_color=COLOR_CARBON_NAIVE,
+        opacity=0.7,
+    ))
+    fig_ccmp.update_layout(
+        barmode="group",
+        yaxis_title="Annual Carbon Avoidance (lbs CO2)",
+        height=400,
+        margin=dict(l=40, r=20, t=20, b=80),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(fig_ccmp, width="stretch")
+
     st.info(
         "Hawaiian Electric (flat rate, no tiers, no TOU, no seasonal variation) "
-        "shows near-zero error because the blended average rate equals the marginal "
+        "shows near-zero cost error because the blended average rate equals the marginal "
         "rate at every hour. All other tariffs with tiers, TOU differentials, or "
-        "seasonal pricing produce measurable errors — the naive method is unreliable "
-        "whenever the rate schedule is non-linear."
+        "seasonal pricing produce measurable cost errors — the naive method is unreliable "
+        "whenever the rate schedule is non-linear. Carbon errors follow a different pattern: "
+        "they depend on the grid's generation mix and renewable penetration, not the tariff structure. "
+        "CAISO shows the largest carbon error due to extreme midday solar depression of marginal emissions."
     )
