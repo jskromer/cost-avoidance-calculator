@@ -17,7 +17,7 @@ In M&V, cost avoidance = what you *would have paid* minus what you *actually pai
 
 - **Synthetic 8760 load shapes** built from baseload + occupancy + weather-driven (HVAC) components with climate-specific temperature models
 - **5 ECM savings profiles** with distinct temporal shapes (lighting, HVAC, envelope, behavioral, flat %)
-- **7 rate structures** from published 2025-2026 tariffs:
+- **7 rate structures** from published 2025-2026 tariffs (retail tariff research by Krow AI — KrowClaw Deliverable #1, March 2026):
 
 | Tariff | Type | Key Feature |
 |--------|------|-------------|

@@ -596,7 +596,8 @@ why the naive method fails:
 All savings shapes are scaled so total annual kWh saved matches the user-selected percentage.
 
 #### Tariff Data
-Seven rate structures are encoded from published 2025–2026 tariff sheets:
+Seven rate structures encoded from published 2025–2026 tariffs. Retail tariff research
+compiled by **Krow (AI)** — KrowClaw Deliverable #1, March 2026:
 
 | Tariff | Structure | Source |
 |--------|-----------|--------|
